@@ -1,9 +1,4 @@
-"""
-config.py — Central Configuration
-
-All paths, hyperparameters, random seeds, and tunable weights are defined here.
-No other file should hardcode any of these values.
-"""
+"""config.py - central settings for the fraud detection project."""
 
 import os
 import logging
@@ -130,3 +125,8 @@ def ensure_dirs():
     dirs = [RAW_DATA_DIR, PROCESSED_DATA_DIR, PLOTS_DIR, RESULTS_DIR, MODELS_DIR]
     for d in dirs:
         os.makedirs(d, exist_ok=True)
+
+
+def setup_dirs():
+    """Short alias used by the main pipeline setup step."""
+    ensure_dirs()
