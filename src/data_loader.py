@@ -249,7 +249,7 @@ def normalize_dataset_sources():
     return _normalize_common_schema(tx_df, gt_df, source)
 
 
-def load_dataset():
+def load_data():
     """
     Load normalized transactions and true account labels.
 
@@ -260,7 +260,7 @@ def load_dataset():
     return tx_df, account_labels
 
 
-def load_ground_truth_labels(G):
+def load_true_labels(G):
     """
     Load TRUE labels from account_ground_truth.csv.
     These must NEVER be generated from heuristics.
@@ -278,6 +278,7 @@ def build_graph(df):
     """Build directed transaction graph from normalized transactions DataFrame."""
     logger.info("Building directed transaction graph...")
 
+    # directed because each transaction has a sender and a receiver
     G = nx.DiGraph()
 
     work = df.copy()
@@ -354,7 +355,7 @@ def build_pyg_data(G, features_df, labels_series=None):
             feature_matrix[idx] = [float(row[col]) for col in feature_cols]
 
     # Build y from TRUE labels only.
-    ground_truth = load_ground_truth_labels(G)
+    ground_truth = load_true_labels(G)
     y_np = np.array([int(ground_truth.get(str(n), 0)) for n in nodes], dtype=np.int64)
     y = torch.tensor(y_np, dtype=torch.long)
 
@@ -384,7 +385,7 @@ def build_pyg_data(G, features_df, labels_series=None):
     val_mask[val_idx] = True
     test_mask[test_idx] = True
 
-    # Fit scaler ONLY on training nodes.
+    # fit scaler only on train nodes to avoid leakage
     scaler = StandardScaler()
     train_mask_np = train_mask.numpy()
     feature_matrix = np.nan_to_num(feature_matrix, nan=0.0, posinf=1.0, neginf=0.0)
@@ -431,7 +432,7 @@ def build_pyg_data(G, features_df, labels_series=None):
     return data, scaler, node_to_idx
 
 
-def load_pyg_data():
+def get_pyg_data():
     """
     Convenience zero-argument wrapper for test harnesses.
 
@@ -440,7 +441,7 @@ def load_pyg_data():
     """
     from src.features import compute_all_features
 
-    df, _ = load_dataset()
+    df, _ = load_data()
     G = build_graph(df)
     features_df = compute_all_features(G)
     data, scaler, node_to_idx = build_pyg_data(G, features_df)
@@ -448,11 +449,17 @@ def load_pyg_data():
     return data, scaler, node_to_idx
 
 
+# Backward-compatible aliases for existing imports.
+load_dataset = load_data
+load_ground_truth_labels = load_true_labels
+load_pyg_data = get_pyg_data
+
+
 if __name__ == "__main__":
     config.ensure_dirs()
     set_seeds()
 
-    df, labels = load_dataset()
+    df, labels = load_data()
     G = build_graph(df)
 
     logger.info("Data load test complete")
