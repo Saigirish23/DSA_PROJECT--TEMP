@@ -4,9 +4,29 @@ A hybrid machine learning pipeline that combines classical graph algorithms (DSA
 
 ## Problem Statement
 
-Financial fraud detection is inherently a network problem. Fraudsters rarely act in isolation; they form complex networks of accounts, money mules, and intermediary nodes to launder funds. Traditional rule-based systems often look at accounts in isolation and fail to capture these structural patterns. 
+Existing fraud detection models assume static graphs, but real transaction 
+networks evolve continuously. Recomputing graph features from scratch is 
+expensive and impractical in real-time systems:
 
-This project solves this by representing financial transactions as a directed graph. We compute structural graph features (using O(V+E) to O(V·E) classical algorithms) to build a transparent heuristic baseline, and then train a Graph Convolutional Network (GCN) to learn complex structural embeddings. Our final resulting system fuses both approaches.
+- Full degree recomputation:    O(V+E)   per update
+- Full PageRank recomputation:  O(k·(V+E)) per update  
+- Full clustering recomputation: O(V·d²) per update
+
+### Novel Contribution: Dynamic Graph Data Structures
+
+This project introduces a dynamic graph layer that maintains features 
+**incrementally** as new transactions arrive:
+
+| Component | Structure | Complexity |
+|---|---|---|
+| Degree tracking | Incremental adjacency list | O(1) per edge |
+| Amount aggregation | Fenwick tree (BIT) | O(log n) update/query |
+| Recent activity | Sliding window + deque | O(1) expiry |
+| PageRank | Local neighborhood update | O(k·deg) per edge |
+| Clustering | Triangle counting on insert | O(d) per edge |
+
+**Key innovation:** Real-time fraud detection without rebuilding the graph.
+Complexity reduced from O(V+E) per update → O(1) or O(log n) incremental updates.
 
 ## Architecture
 
@@ -18,31 +38,36 @@ This project solves this by representing financial transactions as a directed gr
             [ NetworkX DiGraph (V, E) ]
                          |
                          v
-           (Phase 3: Feature Engineering)
-    O(V+E)    : In/Out Degree
-    O(V·d²)   : Clustering Coefficient
-    O(k·(V+E)): PageRank
-    O(V·E)    : Betweenness Centrality
+      (Phase 3: Dynamic Graph Layer - Optional)
+ [ Incremental Adj | Fenwick BIT | Window | Local PR ]
                          |
-          +--------------+--------------+
-          |                             |
-          v                             v
-(Phase 4: Heuristics)         (Phase 5: PyG Data Prep)
-[ Rule-Based Scorer ]         [ Normalized Tensors ]
-          |                             |
-          |                             v
-          |                   (Phase 6: GNN Training)
-          |                   [ 2-Layer GCN Model ]
-          |                             |
-          +--------------+--------------+
+           +-------------+-------------+
+           |                           |
+           v                           v
+ (Static Features Path)        (Dynamic Features Path)
+ O(V+E) / O(V·d²) / ...        O(1) / O(log n) incremental
+           |                           |
+           +-------------+-------------+
                          |
                          v
-             (Phase 7: Hybrid Fusion)
-       [ α · GCN_Prob + (1-α) · Heuristic ]
+                (Phase 4: Heuristics)
+               [ Rule-Based Scorer ]
                          |
                          v
-             (Phase 8: Evaluation)
-        [ Metrics, ROC Curves, Visuals ]
+                (Phase 5: PyG Data Prep)
+               [ Normalized Tensors ]
+                         |
+                         v
+                (Phase 6: GNN Training)
+                 [ FraudGCN Model ]
+                         |
+                         v
+                (Phase 7: Hybrid Fusion)
+         [ α · GCN_Prob + (1-α) · Heuristic ]
+                         |
+                         v
+                (Phase 8: Evaluation)
+           [ Metrics, ROC Curves, Visuals ]
 ```
 
 ## Dataset Description

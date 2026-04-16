@@ -89,6 +89,15 @@ def main():
 
     print("\nTo view results dashboard: python3 dashboard/dashboard_server.py")
 
+    # Optional: train on Bitcoin dataset
+    # Run with: python3 main.py --bitcoin
+    import sys
+    if "--bitcoin" in sys.argv:
+        print("\n[Bitcoin] Starting Elliptic dataset training...")
+        from src.bitcoin_train import train_on_bitcoin
+
+        train_on_bitcoin()
+
 
 if __name__ == "__main__":
     main()

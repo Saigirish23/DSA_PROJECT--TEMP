@@ -9,12 +9,14 @@
 #include "graph_algorithms.h"
 
 #include <algorithm>
+#include <deque>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <queue>
 #include <set>
 #include <sstream>
+#include <tuple>
 #include <unordered_set>
 
 using namespace std;
@@ -340,3 +342,71 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 }
+
+// ── Fenwick Tree (BIT) ────────────────────────────────────────────────────
+// O(log n) point update and prefix query
+// Used for temporal transaction amount aggregation
+struct FenwickTree {
+    int n;
+    vector<double> tree;
+
+    FenwickTree(int n) : n(n), tree(n + 1, 0.0) {}
+
+    void update(int i, double delta) {
+        for (++i; i <= n; i += i & (-i))
+            tree[i] += delta;
+    }
+
+    double query(int i) {
+        double s = 0;
+        for (++i; i > 0; i -= i & (-i))
+            s += tree[i];
+        return s;
+    }
+
+    double range_query(int l, int r) {
+        return l == 0 ? query(r) : query(r) - query(l - 1);
+    }
+};
+
+// ── Incremental Degree Tracker ────────────────────────────────────────────
+// O(1) per update vs O(V+E) full rebuild
+struct IncrementalDegree {
+    unordered_map<string, int> in_deg, out_deg;
+
+    void add_edge(const string& u, const string& v) {
+        out_deg[u]++;
+        in_deg[v]++;
+    }
+
+    int degree(const string& node) {
+        return in_deg[node] + out_deg[node];
+    }
+};
+
+// ── Sliding Window ────────────────────────────────────────────────────────
+// Maintains active edges within [t - W, t]
+struct SlidingWindow {
+    int window_size;
+    deque<tuple<int, string, string>> history;
+    IncrementalDegree deg_tracker;
+
+    SlidingWindow(int w) : window_size(w) {}
+
+    void add_transaction(const string& u, const string& v, int timestamp) {
+        deg_tracker.add_edge(u, v);
+        history.push_back({timestamp, u, v});
+        expire(timestamp);
+    }
+
+    void expire(int current_time) {
+        while (!history.empty()) {
+            auto [t, u, v] = history.front();
+            if (t < current_time - window_size) {
+                deg_tracker.in_deg[v]--;
+                deg_tracker.out_deg[u]--;
+                history.pop_front();
+            } else break;
+        }
+    }
+};

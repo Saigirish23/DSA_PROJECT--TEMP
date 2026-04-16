@@ -190,7 +190,7 @@ def compute_betweenness(G):
     return betweenness
 
 
-def compute_features(G):
+def compute_features(G, use_dynamic=False, transactions_df=None):
     """
     Compute all graph-structural features for every node.
 
@@ -199,6 +199,9 @@ def compute_features(G):
 
     Args:
         G (nx.DiGraph): Directed transaction graph.
+        use_dynamic (bool): Use incremental dynamic feature path when True.
+        transactions_df (pd.DataFrame | None): Transaction rows required for
+            dynamic mode with sender_id, receiver_id, amount, timestamp/timestamp_int.
 
     Returns:
         pd.DataFrame: Feature matrix with columns:
@@ -206,6 +209,32 @@ def compute_features(G):
             clustering_coefficient, pagerank, betweenness_centrality
     """
     logger.info("Computing all graph-structural features...")
+
+    if use_dynamic and transactions_df is not None:
+        logger.info("  Using dynamic graph feature computation")
+        from src.dynamic_graph import DynamicFraudGraph
+
+        dg = DynamicFraudGraph(window_size=7)
+        for _, row in transactions_df.iterrows():
+            sender = str(row["sender_id"])
+            receiver = str(row["receiver_id"])
+            amount = float(row.get("amount", 0.0))
+            timestamp = row.get("timestamp_int", 0)
+            if "timestamp" in row and ("timestamp_int" not in row or pd.isna(timestamp)):
+                try:
+                    timestamp = int(pd.Timestamp(row["timestamp"]).timestamp())
+                except Exception:
+                    timestamp = 0
+            timestamp = int(timestamp) if not pd.isna(timestamp) else 0
+            dg.add_transaction(sender, receiver, amount, timestamp)
+
+        features_df = dg.get_all_features()
+        if "node_id" in features_df.columns:
+            features_df["node_id"] = features_df["node_id"].astype(str)
+        config.ensure_dirs()
+        features_df.to_csv(config.NODE_FEATURES_PATH, index=False)
+        logger.info("  Saved feature matrix to %s", config.NODE_FEATURES_PATH)
+        return features_df
 
     # Try C++ backend first (fast path), but keep output schema identical
     # to the existing NetworkX pipeline expectations.
