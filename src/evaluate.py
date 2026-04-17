@@ -2,7 +2,7 @@
 evaluate.py — Metrics & Evaluation
 
 Computes comprehensive evaluation metrics and generates visualizations:
-  - Classification metrics: Accuracy, Precision, Recall, F1, ROC-AUC
+    - Classification metrics: Accuracy, Precision, Recall, F1, ROC-AUC, PR-AUC
   - Confusion Matrix
   - Training loss curves
   - ROC curves for all model variants
@@ -23,7 +23,7 @@ import pandas as pd
 import networkx as nx
 from sklearn.metrics import (
     accuracy_score, precision_score, recall_score, f1_score,
-    roc_auc_score, roc_curve, confusion_matrix
+    roc_auc_score, roc_curve, confusion_matrix, average_precision_score
 )
 
 import config
@@ -43,6 +43,27 @@ def compute_all_metrics(y_true, y_pred, y_prob=None):
     Returns:
         dict: Metrics dictionary.
     """
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    labeled_mask = y_true != -1
+    y_true = y_true[labeled_mask]
+    y_pred = y_pred[labeled_mask]
+
+    if y_prob is not None:
+        y_prob = np.asarray(y_prob)[labeled_mask]
+
+    if y_true.size == 0:
+        empty_metrics = {
+            "accuracy": 0.0,
+            "precision": 0.0,
+            "recall": 0.0,
+            "f1": 0.0,
+        }
+        if y_prob is not None:
+            empty_metrics["roc_auc"] = 0.5
+            empty_metrics["pr_auc"] = 0.0
+        return empty_metrics
+
     metrics = {
         "accuracy": accuracy_score(y_true, y_pred),
         "precision": precision_score(y_true, y_pred, zero_division=0),
@@ -55,6 +76,10 @@ def compute_all_metrics(y_true, y_pred, y_prob=None):
             metrics["roc_auc"] = roc_auc_score(y_true, y_prob)
         except ValueError:
             metrics["roc_auc"] = 0.0
+        try:
+            metrics["pr_auc"] = average_precision_score(y_true, y_prob)
+        except ValueError:
+            metrics["pr_auc"] = float(y_true.mean()) if len(y_true) else 0.0
 
     return metrics
 
@@ -71,22 +96,29 @@ def plot_loss_curve(history, save_path=None):
 
     fig, ax1 = plt.subplots(figsize=(10, 6))
 
-    epochs = range(1, len(history["train_loss"]) + 1)
+    loss_key = "train_loss" if "train_loss" in history else "loss"
+    if loss_key not in history:
+        logger.warning("History missing loss key; skipping loss curve plot")
+        return
+
+    epochs = range(1, len(history[loss_key]) + 1)
 
     # Loss curve
     color_loss = "#e74c3c"
-    ax1.plot(epochs, history["train_loss"], color=color_loss, linewidth=2, label="Train Loss")
+    ax1.plot(epochs, history[loss_key], color=color_loss, linewidth=2, label="Train Loss")
     ax1.set_xlabel("Epoch", fontsize=13)
     ax1.set_ylabel("Loss", fontsize=13, color=color_loss)
     ax1.tick_params(axis="y", labelcolor=color_loss)
 
     # F1 curve on secondary y-axis
-    if "test_f1" in history:
+    if "test_f1" in history or "val_f1" in history:
+        f1_key = "test_f1" if "test_f1" in history else "val_f1"
+        f1_label = "Test F1" if f1_key == "test_f1" else "Validation F1"
         ax2 = ax1.twinx()
         color_f1 = "#2ecc71"
-        ax2.plot(epochs, history["test_f1"], color=color_f1, linewidth=2,
-                 linestyle="--", label="Test F1")
-        ax2.set_ylabel("Test F1 Score", fontsize=13, color=color_f1)
+        ax2.plot(epochs, history[f1_key], color=color_f1, linewidth=2,
+                 linestyle="--", label=f1_label)
+        ax2.set_ylabel("F1 Score", fontsize=13, color=color_f1)
         ax2.tick_params(axis="y", labelcolor=color_f1)
 
     fig.suptitle("GCN Training: Loss & F1 Over Epochs", fontsize=15, fontweight="bold")
@@ -237,17 +269,31 @@ def plot_feature_distributions(features_df, labels, save_path=None):
     else:
         df["is_fraud"] = df["node_id"].map(labels).fillna(0).astype(int)
 
-    feature_cols = ["total_degree", "clustering_coefficient", "pagerank", "betweenness_centrality"]
-    feature_labels = ["Total Degree", "Clustering Coefficient", "PageRank", "Betweenness Centrality"]
+    feature_specs = [
+        ("degree", "Degree", "total_degree"),
+        ("in_degree", "In Degree", None),
+        ("out_degree", "Out Degree", None),
+        ("clustering", "Clustering", "clustering_coefficient"),
+        ("pagerank", "PageRank", None),
+    ]
 
-    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig, axes = plt.subplots(2, 3, figsize=(16, 10))
     axes = axes.flatten()
 
-    for i, (col, label) in enumerate(zip(feature_cols, feature_labels)):
+    for i, (canonical_col, label, legacy_col) in enumerate(feature_specs):
         ax = axes[i]
 
-        fraud_data = df[df["is_fraud"] == 1][col]
-        normal_data = df[df["is_fraud"] == 0][col]
+        source_col = canonical_col
+        if source_col not in df.columns and legacy_col is not None and legacy_col in df.columns:
+            source_col = legacy_col
+        if source_col not in df.columns:
+            ax.set_title(label + " (missing)", fontsize=13, fontweight="bold")
+            ax.text(0.5, 0.5, "No data", ha="center", va="center", transform=ax.transAxes)
+            ax.axis("off")
+            continue
+
+        fraud_data = df[df["is_fraud"] == 1][source_col]
+        normal_data = df[df["is_fraud"] == 0][source_col]
 
         ax.hist(normal_data, bins=25, alpha=0.6, color="#3498db", label="Normal", density=True)
         ax.hist(fraud_data, bins=25, alpha=0.6, color="#e74c3c", label="Fraud", density=True)
@@ -257,6 +303,9 @@ def plot_feature_distributions(features_df, labels, save_path=None):
         ax.set_title(label, fontsize=13, fontweight="bold")
         ax.legend(fontsize=10)
         ax.grid(True, alpha=0.3)
+
+    # Hide unused subplot (2x3 grid for 5 features).
+    axes[-1].axis("off")
 
     fig.suptitle("Feature Distributions: Fraud vs. Normal Accounts",
                  fontsize=15, fontweight="bold")
@@ -328,8 +377,49 @@ def generate_final_report(comparison_df, save_path=None):
     return save_path
 
 
+def export_node_predictions(data, gnn_preds, gnn_probs, node_to_idx=None, save_path=None):
+    """
+    Export node-level predictions for dashboard consumption.
+
+    Required columns:
+      - node_id (original dataset IDs)
+      - true_label
+      - predicted_label
+      - predicted_probability (fraud class probability)
+    """
+    save_path = save_path or os.path.join(config.RESULTS_DIR, "node_predictions.csv")
+
+    y_true = data.y.detach().cpu().numpy().astype(int)
+    y_pred = gnn_preds.detach().cpu().numpy().astype(int)
+    y_prob = gnn_probs.detach().cpu().numpy()[:, 1].astype(float)
+    num_nodes = len(y_true)
+
+    if node_to_idx is not None:
+        idx_to_node = {int(idx): str(node_id) for node_id, idx in node_to_idx.items()}
+        node_ids = [idx_to_node.get(i, str(i)) for i in range(num_nodes)]
+    else:
+        logger.warning("No node_to_idx mapping provided; exporting fallback index-based node IDs")
+        node_ids = [str(i) for i in range(num_nodes)]
+
+    pred_df = pd.DataFrame(
+        {
+            "node_id": node_ids,
+            "true_label": y_true,
+            "predicted_label": y_pred,
+            "predicted_probability": y_prob,
+        }
+    )
+
+    # Backward-compatible alias for existing dashboard adapters.
+    pred_df["fraud_probability"] = pred_df["predicted_probability"]
+
+    pred_df.to_csv(save_path, index=False)
+    logger.info("  Node predictions exported to %s", save_path)
+    return save_path
+
+
 def run_full_evaluation(G, features_df, labels_df, data, model, history,
-                        account_labels, device="cpu"):
+                        account_labels, device="cpu", node_to_idx=None):
     """
     Run the complete evaluation pipeline with all visualizations.
 
@@ -342,6 +432,7 @@ def run_full_evaluation(G, features_df, labels_df, data, model, history,
         history (dict): Training history.
         account_labels (dict): Ground truth labels.
         device (str): 'cuda' or 'cpu'.
+        node_to_idx (dict | None): Optional node-to-index mapping from build_pyg_data.
 
     Returns:
         pd.DataFrame: Final comparison table.
@@ -359,27 +450,55 @@ def run_full_evaluation(G, features_df, labels_df, data, model, history,
     # 1. Loss curve
     plot_loss_curve(history)
 
+    requested_device = str(device)
+    if requested_device.startswith("cuda") and not torch.cuda.is_available():
+        logger.warning("Requested evaluation device '%s' but CUDA is unavailable; using CPU", requested_device)
+        eval_device = torch.device("cpu")
+    else:
+        eval_device = torch.device(requested_device)
+
+    # Keep model/data on the same device for evaluation to avoid silent CPU execution.
+    model = model.to(eval_device)
+    data_eval = data.to(eval_device)
+    logger.info("Evaluation device verification:")
+    logger.info("  - Using torch device: %s", eval_device)
+    logger.info("  - torch.cuda.is_available(): %s", torch.cuda.is_available())
+    logger.info("  - model parameter device: %s", next(model.parameters()).device)
+    logger.info("  - data.x device: %s", data_eval.x.device)
+    logger.info("  - data.edge_index device: %s", data_eval.edge_index.device)
+
     # 2. Get GNN predictions for ROC curves
-    gnn_preds, gnn_probs = get_gnn_predictions(model, data, device)
+    gnn_preds, gnn_probs = get_gnn_predictions(model, data_eval, str(eval_device))
+
+    # Export dashboard predictions early so file is always available.
+    export_node_predictions(data_eval, gnn_preds, gnn_probs, node_to_idx=node_to_idx)
 
     # 3. Run hybrid comparison
     comparison, fusion_results, best_alpha = run_hybrid_comparison(
-        G, features_df, labels_df, data, model, device
+        G, features_df, labels_df, data_eval, model, str(eval_device)
     )
 
-    # 4. ROC curves (using heuristic labels as ground truth for test set)
-    test_mask_cpu = data.test_mask.cpu()
-    y_true_test = data.y.cpu()[test_mask_cpu].numpy()
+    # 4. ROC curves (strictly labeled test nodes only).
+    test_mask_cpu = data_eval.test_mask.detach().cpu()
+    labeled_mask_cpu = data_eval.y.detach().cpu() != -1
+    eval_mask_cpu = test_mask_cpu & labeled_mask_cpu
+    y_true_test = data_eval.y.detach().cpu()[eval_mask_cpu].numpy()
+    if y_true_test.size == 0:
+        logger.warning("No labeled nodes available in evaluation test split; skipping ROC and confusion plots")
+        generate_final_report(comparison)
+        return comparison
 
     # Heuristic scores for test nodes
-    fraud_scores = labels_df.set_index("node_id")["fraud_score"]
+    labels_work = labels_df.copy()
+    labels_work["node_id"] = labels_work["node_id"].astype(str)
+    fraud_scores = labels_work.set_index("node_id")["fraud_score"]
     nodes = sorted(G.nodes())
-    node_to_idx = {node: idx for idx, node in enumerate(nodes)}
+    graph_node_to_idx = {node: idx for idx, node in enumerate(nodes)}
 
     h_scores = np.zeros(len(nodes), dtype=np.float32)
     for node in nodes:
-        h_scores[node_to_idx[node]] = fraud_scores.get(node, 0.0)
-    h_scores_test = h_scores[test_mask_cpu.numpy()]
+        h_scores[graph_node_to_idx[node]] = fraud_scores.get(str(node), 0.0)
+    h_scores_test = h_scores[eval_mask_cpu.numpy()]
 
     # Normalize heuristic scores
     h_min, h_max = h_scores_test.min(), h_scores_test.max()
@@ -388,7 +507,7 @@ def run_full_evaluation(G, features_df, labels_df, data, model, history,
     else:
         h_scores_norm = h_scores_test
 
-    gnn_probs_test = gnn_probs[test_mask_cpu][:, 1].numpy()
+    gnn_probs_test = gnn_probs[eval_mask_cpu][:, 1].numpy()
 
     # Late fusion scores for best alpha
     fusion_scores_test = best_alpha * gnn_probs_test + (1 - best_alpha) * h_scores_norm
@@ -407,7 +526,7 @@ def run_full_evaluation(G, features_df, labels_df, data, model, history,
     plot_feature_distributions(features_df, account_labels)
 
     # 7. Confusion matrices
-    gnn_pred_test = gnn_preds[test_mask_cpu].numpy()
+    gnn_pred_test = gnn_preds[eval_mask_cpu].numpy()
     plot_confusion_matrix(y_true_test, gnn_pred_test, "GNN",
                           os.path.join(config.PLOTS_DIR, "confusion_matrix_gnn.png"))
 

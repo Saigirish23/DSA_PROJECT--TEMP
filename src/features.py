@@ -1,367 +1,428 @@
-"""
-features.py — Graph Feature Engineering (DSA Core)
+"""Feature engineering for AML graph learning."""
 
-Computes structural graph features for every node in the transaction graph.
-Each feature is implemented with a clear explanation of:
-  - What the algorithm does
-  - Why it matters for fraud detection
-  - Its time complexity
-
-Features computed:
-  1. Degree (in + out)     — O(V + E)  — Hub detection
-  2. Clustering Coefficient — O(V · d²) — Broker/mule detection
-  3. PageRank              — O(k·(V+E)) — Centrality in flow network
-  4. Betweenness Centrality — O(V · E)  — Bridges between clusters
-"""
+import importlib
+import os
+import sys
 
 import networkx as nx
 import numpy as np
 import pandas as pd
-import os
-import sys
 
 import config
 
 logger = config.setup_logging(__name__)
 
 
+CANONICAL_FEATURE_COLUMNS = ["degree", "in_degree", "out_degree", "clustering", "pagerank"]
+FULL_FEATURE_COLUMNS = [
+    "degree",
+    "in_degree",
+    "out_degree",
+    "clustering",
+    "pagerank",
+    "tx_count_window",
+    "amount_std_window",
+    "unique_peers_window",
+    "night_tx_ratio",
+    "neighbor_fraud_ratio",
+    "neighbor_degree_mean",
+    "in_out_ratio",
+    "is_bridge",
+    "local_efficiency",
+]
+
+
+def _coerce_transactions(transactions_df=None):
+    """Load or normalize transactions with timestamp and amount fields."""
+    if transactions_df is None:
+        if not os.path.exists(config.RAW_TRANSACTIONS_PATH):
+            return None
+        transactions_df = pd.read_csv(config.RAW_TRANSACTIONS_PATH)
+
+    required = {"sender_id", "receiver_id", "amount", "timestamp"}
+    if not required.issubset(set(transactions_df.columns)):
+        logger.warning(
+            "Transactions missing required columns for temporal features: %s",
+            sorted(required - set(transactions_df.columns)),
+        )
+        return None
+
+    tx = transactions_df.copy()
+    tx["sender_id"] = tx["sender_id"].astype(str)
+    tx["receiver_id"] = tx["receiver_id"].astype(str)
+    tx["amount"] = pd.to_numeric(tx["amount"], errors="coerce").fillna(0.0)
+
+    ts = pd.to_datetime(tx["timestamp"], errors="coerce", utc=True)
+    ts = ts.fillna(pd.Timestamp("2023-01-01", tz="UTC"))
+    tx["timestamp"] = ts.dt.tz_convert(None)
+    tx["timestamp_int"] = tx["timestamp"].astype("int64") // 10**9
+    tx["hour"] = tx["timestamp"].dt.hour.astype(int)
+    return tx
+
+
 def compute_degree(G):
-    """
-    Compute in-degree, out-degree, and total degree for each node.
-
-    Algorithm:
-        For a directed graph, in-degree = number of incoming edges,
-        out-degree = number of outgoing edges. Total degree = in + out.
-        This is computed by a single traversal of the adjacency list.
-
-    Why it matters:
-        High-degree nodes are hubs in the transaction network.
-        Fraudulent accounts often have unusually high degree because
-        they transact with many victims or launder through many accounts.
-
-    Complexity: O(V + E)
-        Each edge contributes to one in-degree and one out-degree count.
-
-    Args:
-        G (nx.DiGraph): Directed transaction graph.
-
-    Returns:
-        dict: {node_id: {"in_degree": int, "out_degree": int, "total_degree": int}}
-    """
-    logger.info("  Computing degree features... [O(V+E)]")
-    # high-degree nodes interact with many accounts, which can be a fraud signal
-
+    """Compute in/out/total degree."""
     degree_features = {}
     for node in G.nodes():
-        in_deg = G.in_degree(node)
-        out_deg = G.out_degree(node)
+        in_deg = int(G.in_degree(node))
+        out_deg = int(G.out_degree(node))
         degree_features[node] = {
+            "degree": in_deg + out_deg,
             "in_degree": in_deg,
             "out_degree": out_deg,
-            "total_degree": in_deg + out_deg,
         }
-
     return degree_features
 
 
 def compute_clustering(G):
-    """
-    Compute the clustering coefficient for each node.
-
-    Algorithm:
-        The clustering coefficient measures the fraction of a node's neighbors
-        that are also connected to each other (triangle density). For a directed
-        graph, we use the undirected version to compute triangles.
-
-        For each node v with degree d(v):
-            C(v) = 2 * |triangles(v)| / (d(v) * (d(v) - 1))
-
-        Triangle counting is done by checking, for each pair of neighbors (u, w),
-        whether an edge (u, w) exists.
-
-    Why it matters:
-        Legitimate accounts tend to form tight-knit communities (high clustering).
-        Fraudulent accounts acting as brokers or mules connect disparate groups,
-        resulting in LOW clustering coefficients. This makes clustering coefficient
-        inversely correlated with fraud likelihood.
-
-    Complexity: O(V · d²)
-        For each node, we examine all pairs of neighbors. In the worst case
-        (star graph), d can be O(V), making it O(V³). In sparse graphs with
-        bounded degree, it's much faster.
-
-    Args:
-        G (nx.DiGraph): Directed transaction graph.
-
-    Returns:
-        dict: {node_id: float} — clustering coefficient in [0, 1].
-    """
-    logger.info("  Computing clustering coefficients... [O(V·d²)]")
-    # low clustering often means a node connects otherwise unrelated accounts
-
-    # Use undirected version for triangle counting
-    undirected = G.to_undirected()
-    clustering = nx.clustering(undirected)
-
-    return clustering
+    """Compute clustering coefficient on undirected projection."""
+    return nx.clustering(G.to_undirected())
 
 
 def compute_pagerank(G):
-    """
-    Compute PageRank for each node using the power iteration method.
-
-    Algorithm:
-        PageRank models a random walk on the graph. A surfer at node u follows
-        a random outgoing edge with probability (1 - alpha), or jumps to any
-        random node with probability alpha (damping factor, typically 0.85).
-
-        The score represents the steady-state probability of the surfer being
-        at each node. Computed iteratively:
-            PR(v) = alpha/N + (1-alpha) * Σ PR(u) / out_deg(u)
-                    for all u with edge u→v
-
-        Iteration continues until convergence (change < epsilon) or max
-        iterations reached.
-
-    Why it matters:
-        PageRank measures a node's importance in the flow network. Fraudulent
-        accounts that receive money from many sources (e.g., in money laundering)
-        will have high PageRank because they accumulate "importance" from
-        incoming transactions.
-
-    Complexity: O(k · (V + E))
-        Each iteration traverses all edges once. k = number of iterations
-        until convergence (typically 50–100 for sparse graphs).
-
-    Args:
-        G (nx.DiGraph): Directed transaction graph.
-
-    Returns:
-        dict: {node_id: float} — PageRank score (sums to 1.0).
-    """
-    logger.info("  Computing PageRank... [O(k·(V+E)), k=100 max iterations]")
-
-    # standard pagerank with damping factor 0.85
-    pagerank = nx.pagerank(G, alpha=0.85, max_iter=100, tol=1e-6)
-
-    return pagerank
+    """Compute PageRank for directed graph."""
+    return nx.pagerank(G, alpha=0.85, max_iter=100, tol=1e-6)
 
 
-def compute_betweenness(G):
-    """
-    Compute betweenness centrality for each node.
+def _compute_base_features_cpp_or_nx(G):
+    """Compute canonical structural features with C++ fast path and NetworkX fallback."""
+    records = None
 
-    Algorithm:
-        Betweenness centrality measures how often a node lies on the shortest
-        path between all pairs of other nodes. For each pair (s, t), we run
-        BFS (unweighted) from s, then accumulate the fraction of shortest
-        paths through each intermediate node.
-
-        BC(v) = Σ σ(s,t|v) / σ(s,t)
-                for all s ≠ v ≠ t
-
-        where σ(s,t) = number of shortest paths from s to t
-              σ(s,t|v) = number of those paths passing through v
-
-        Brandes' algorithm computes this efficiently by combining forward BFS
-        with backward accumulation.
-
-    Why it matters:
-        Nodes with high betweenness are bridges between clusters. In fraud
-        networks, these are often money mules or intermediaries connecting
-        fraud rings to legitimate accounts. Disrupting these nodes can
-        break the fraud network.
-
-    Complexity: O(V · E)
-        Brandes' algorithm runs BFS from each node (O(V+E) per source),
-        for V sources total. For sparse graphs, this is approximately O(V·E).
-
-    Args:
-        G (nx.DiGraph): Directed transaction graph.
-
-    Returns:
-        dict: {node_id: float} — betweenness centrality in [0, 1].
-    """
-    logger.info("  Computing betweenness centrality... [O(V·E)] (may take a moment)")
-
-    # normalized=True keeps values comparable across graph sizes
-    betweenness = nx.betweenness_centrality(G, normalized=True)
-
-    return betweenness
-
-
-def compute_features(G, use_dynamic=False, transactions_df=None):
-    """
-    Compute all graph-structural features for every node.
-
-    Combines degree, clustering coefficient, PageRank, and betweenness
-    centrality into a single DataFrame for downstream use.
-
-    Args:
-        G (nx.DiGraph): Directed transaction graph.
-        use_dynamic (bool): Use incremental dynamic feature path when True.
-        transactions_df (pd.DataFrame | None): Transaction rows required for
-            dynamic mode with sender_id, receiver_id, amount, timestamp/timestamp_int.
-
-    Returns:
-        pd.DataFrame: Feature matrix with columns:
-            node_id, in_degree, out_degree, total_degree,
-            clustering_coefficient, pagerank, betweenness_centrality
-    """
-    logger.info("Computing all graph-structural features...")
-
-    if use_dynamic and transactions_df is not None:
-        logger.info("  Using dynamic graph feature computation")
-        from src.dynamic_graph import DynamicFraudGraph
-
-        dg = DynamicFraudGraph(window_size=7)
-        for _, row in transactions_df.iterrows():
-            sender = str(row["sender_id"])
-            receiver = str(row["receiver_id"])
-            amount = float(row.get("amount", 0.0))
-            timestamp = row.get("timestamp_int", 0)
-            if "timestamp" in row and ("timestamp_int" not in row or pd.isna(timestamp)):
-                try:
-                    timestamp = int(pd.Timestamp(row["timestamp"]).timestamp())
-                except Exception:
-                    timestamp = 0
-            timestamp = int(timestamp) if not pd.isna(timestamp) else 0
-            dg.add_transaction(sender, receiver, amount, timestamp)
-
-        features_df = dg.get_all_features()
-        if "node_id" in features_df.columns:
-            features_df["node_id"] = features_df["node_id"].astype(str)
-        config.ensure_dirs()
-        features_df.to_csv(config.NODE_FEATURES_PATH, index=False)
-        logger.info("  Saved feature matrix to %s", config.NODE_FEATURES_PATH)
-        return features_df
-
-    # Try C++ backend first (fast path), but keep output schema identical
-    # to the existing NetworkX pipeline expectations.
     try:
         cpp_dir = os.path.join(os.path.dirname(__file__), "..", "cpp")
         if cpp_dir not in sys.path:
             sys.path.insert(0, cpp_dir)
-        from graph_runner import run_cpp_algorithms
 
-        edge_file = config.RAW_TRANSACTIONS_PATH
-        cpp_result = run_cpp_algorithms(edge_file)
+        runner_module = importlib.import_module("graph_runner")
+        run_cpp_algorithms = getattr(runner_module, "run_cpp_algorithms")
 
+        cpp_result = run_cpp_algorithms(config.RAW_TRANSACTIONS_PATH)
         if cpp_result is not None:
             graph_nodes = set(str(n) for n in G.nodes())
             cpp_nodes = set(str(n) for n in cpp_result.index)
             if graph_nodes == cpp_nodes:
-                logger.info("  Using C++ computed features")
-
+                logger.info("Using C++ structural features")
                 records = []
                 for node in sorted(G.nodes()):
                     n = str(node)
                     in_deg = int(G.in_degree(node))
                     out_deg = int(G.out_degree(node))
-                    degree = int(cpp_result.at[n, "degree"])
-                    records.append({
-                        "node_id": n,
-                        "in_degree": in_deg,
-                        "out_degree": out_deg,
-                        "total_degree": degree,
-                        "clustering_coefficient": float(cpp_result.at[n, "clustering"]),
-                        "pagerank": float(cpp_result.at[n, "pagerank"]),
-                        "betweenness_centrality": float(cpp_result.at[n, "betweenness"]),
-                    })
-
-                features_df = pd.DataFrame(records)
-                config.ensure_dirs()
-                features_df.to_csv(config.NODE_FEATURES_PATH, index=False)
-                logger.info("  Saved feature matrix to %s", config.NODE_FEATURES_PATH)
-
-                logger.info("\n  Feature Distribution Statistics:")
-                logger.info("  %s", "-" * 70)
-                stat_cols = ["in_degree", "out_degree", "total_degree",
-                             "clustering_coefficient", "pagerank", "betweenness_centrality"]
-                for col in stat_cols:
-                    stats = features_df[col].describe()
-                    logger.info(
-                        "  %-25s  mean=%.4f  std=%.4f  min=%.4f  max=%.4f",
-                        col, stats["mean"], stats["std"], stats["min"], stats["max"]
+                    records.append(
+                        {
+                            "node_id": n,
+                            "degree": int(cpp_result.at[n, "degree"]),
+                            "in_degree": in_deg,
+                            "out_degree": out_deg,
+                            "clustering": float(cpp_result.at[n, "clustering"]),
+                            "pagerank": float(cpp_result.at[n, "pagerank"]),
+                        }
                     )
-                logger.info("  %s", "-" * 70)
-
-                logger.info("  ✅ Feature engineering complete: %d nodes × %d features",
-                            len(features_df), len(stat_cols))
-                return features_df
-
-            logger.warning(
-                "  C++ node mismatch (%d vs %d), using NetworkX",
-                len(cpp_nodes), len(graph_nodes)
-            )
+            else:
+                logger.warning("C++ node mismatch, falling back to NetworkX")
     except Exception as exc:
-        logger.warning("  C++ backend unavailable, using NetworkX (%s)", exc)
+        logger.warning("C++ backend unavailable; fallback to NetworkX (%s)", exc)
 
-    logger.info("  Using NetworkX features (C++ not available)")
+    if records is None:
+        logger.info("Using NetworkX structural features")
+        degree_features = compute_degree(G)
+        clustering = compute_clustering(G)
+        pagerank = compute_pagerank(G)
 
-    # Compute each feature set
-    degree_features = compute_degree(G)
-    clustering = compute_clustering(G)
-    pagerank = compute_pagerank(G)
-    betweenness = compute_betweenness(G)
+        records = []
+        for node in sorted(G.nodes()):
+            records.append(
+                {
+                    "node_id": str(node),
+                    "degree": float(degree_features[node]["degree"]),
+                    "in_degree": float(degree_features[node]["in_degree"]),
+                    "out_degree": float(degree_features[node]["out_degree"]),
+                    "clustering": float(clustering.get(node, 0.0)),
+                    "pagerank": float(pagerank.get(node, 0.0)),
+                }
+            )
 
-    # Assemble into DataFrame
-    records = []
-    for node in sorted(G.nodes()):
-        records.append({
-            "node_id": node,
-            "in_degree": degree_features[node]["in_degree"],
-            "out_degree": degree_features[node]["out_degree"],
-            "total_degree": degree_features[node]["total_degree"],
-            "clustering_coefficient": clustering.get(node, 0.0),
-            "pagerank": pagerank.get(node, 0.0),
-            "betweenness_centrality": betweenness.get(node, 0.0),
-        })
+    return pd.DataFrame(records)
 
-    features_df = pd.DataFrame(records)
 
-    # Save to disk
-    config.ensure_dirs()
-    features_df.to_csv(config.NODE_FEATURES_PATH, index=False)
-    logger.info("  Saved feature matrix to %s", config.NODE_FEATURES_PATH)
+def _compute_temporal_features(nodes, tx):
+    """Compute temporal burst and activity features over 7-day sliding windows."""
+    default_row = {
+        "tx_count_window": 0.0,
+        "amount_std_window": 0.0,
+        "unique_peers_window": 0.0,
+        "night_tx_ratio": 0.0,
+    }
+    if tx is None or len(tx) == 0:
+        return pd.DataFrame([{"node_id": str(n), **default_row} for n in nodes])
 
-    # Print distribution statistics
-    logger.info("\n  Feature Distribution Statistics:")
-    logger.info("  %s", "-" * 70)
-    stat_cols = ["in_degree", "out_degree", "total_degree",
-                 "clustering_coefficient", "pagerank", "betweenness_centrality"]
-    for col in stat_cols:
-        stats = features_df[col].describe()
-        logger.info(
-            "  %-25s  mean=%.4f  std=%.4f  min=%.4f  max=%.4f",
-            col, stats["mean"], stats["std"], stats["min"], stats["max"]
+    # Build endpoint-wise transaction view so each transaction contributes to both nodes.
+    left = tx[["sender_id", "receiver_id", "amount", "timestamp_int", "hour"]].rename(
+        columns={"sender_id": "node_id", "receiver_id": "peer_id"}
+    )
+    right = tx[["sender_id", "receiver_id", "amount", "timestamp_int", "hour"]].rename(
+        columns={"receiver_id": "node_id", "sender_id": "peer_id"}
+    )
+    node_tx = pd.concat([left, right], axis=0, ignore_index=True)
+    node_tx["node_id"] = node_tx["node_id"].astype(str)
+    node_tx["peer_id"] = node_tx["peer_id"].astype(str)
+
+    window_seconds = 7 * 24 * 60 * 60
+    out_rows = []
+
+    grouped = node_tx.groupby("node_id", sort=False)
+    for node in nodes:
+        node_key = str(node)
+        if node_key not in grouped.groups:
+            out_rows.append({"node_id": node_key, **default_row})
+            continue
+
+        g = grouped.get_group(node_key).sort_values("timestamp_int", kind="mergesort")
+        ts = g["timestamp_int"].to_numpy(dtype=np.int64)
+        amt = g["amount"].to_numpy(dtype=np.float64)
+        peers = g["peer_id"].to_numpy(dtype=object)
+        hours = g["hour"].to_numpy(dtype=np.int64)
+
+        start = 0
+        best_count = 0
+        best_start = 0
+        best_end = -1
+        for end in range(len(ts)):
+            while ts[end] - ts[start] > window_seconds:
+                start += 1
+            count = end - start + 1
+            if count > best_count:
+                best_count = count
+                best_start = start
+                best_end = end
+
+        if best_end >= best_start:
+            seg_amt = amt[best_start : best_end + 1]
+            seg_peers = peers[best_start : best_end + 1]
+            amount_std = float(np.std(seg_amt)) if seg_amt.size > 1 else 0.0
+            unique_peers = float(len(set(seg_peers.tolist())))
+        else:
+            amount_std = 0.0
+            unique_peers = 0.0
+
+        night_ratio = float(np.mean((hours >= 0) & (hours < 6))) if len(hours) else 0.0
+
+        out_rows.append(
+            {
+                "node_id": node_key,
+                "tx_count_window": float(best_count),
+                "amount_std_window": amount_std,
+                "unique_peers_window": unique_peers,
+                "night_tx_ratio": night_ratio,
+            }
         )
-    logger.info("  %s", "-" * 70)
 
-    logger.info("  ✅ Feature engineering complete: %d nodes × %d features",
-                len(features_df), len(stat_cols))
+    return pd.DataFrame(out_rows)
 
-    return features_df
+
+def _derive_heuristic_flags(base_df):
+    """Generate heuristic flags for neighbor risk aggregation."""
+    w = config.HEURISTIC_WEIGHTS
+
+    tmp = base_df.copy()
+    for c in ["degree", "clustering", "pagerank"]:
+        cmin = float(tmp[c].min())
+        cmax = float(tmp[c].max())
+        if cmax > cmin:
+            tmp[f"norm_{c}"] = (tmp[c] - cmin) / (cmax - cmin)
+        else:
+            tmp[f"norm_{c}"] = 0.0
+
+    tmp["heuristic_score"] = (
+        float(w["w1"]) * tmp["norm_degree"]
+        + float(w["w2"]) * (1.0 - tmp["norm_clustering"])
+        + float(w["w3"]) * tmp["norm_pagerank"]
+    )
+
+    q = max(0.0, min(1.0, 1.0 - float(config.HEURISTIC_FRAUD_THRESHOLD)))
+    threshold = float(tmp["heuristic_score"].quantile(q)) if len(tmp) else 1.0
+    tmp["heuristic_flag"] = (tmp["heuristic_score"] >= threshold).astype(int)
+
+    return tmp[["node_id", "heuristic_flag"]]
+
+
+def _local_efficiency_from_neighbors(undirected_graph, node):
+    """Compute harmonic mean of inverse shortest paths inside node's neighbor ego-subgraph."""
+    neighbors = list(undirected_graph.neighbors(node))
+    if len(neighbors) < 2:
+        return 0.0
+
+    sub = undirected_graph.subgraph(neighbors)
+    n = sub.number_of_nodes()
+    if n < 2:
+        return 0.0
+
+    lengths = dict(nx.all_pairs_shortest_path_length(sub))
+    nodes = list(sub.nodes())
+    pair_count = n * (n - 1) / 2.0
+    if pair_count <= 0:
+        return 0.0
+
+    inv_sum = 0.0
+    for i, u in enumerate(nodes):
+        du = lengths.get(u, {})
+        for v in nodes[i + 1 :]:
+            d = du.get(v, None)
+            if d is not None and d > 0:
+                inv_sum += 1.0 / float(d)
+
+    return float(inv_sum / pair_count)
+
+
+def _compute_ego_topological_features(G, base_df):
+    """Compute ego-neighborhood and topological descriptors."""
+    undirected = G.to_undirected()
+    bridges = set(nx.articulation_points(undirected)) if undirected.number_of_nodes() else set()
+
+    deg_map = dict(zip(base_df["node_id"].astype(str), base_df["degree"].astype(float)))
+    flag_df = _derive_heuristic_flags(base_df)
+    flag_map = dict(zip(flag_df["node_id"].astype(str), flag_df["heuristic_flag"].astype(float)))
+
+    rows = []
+    for node in sorted(G.nodes()):
+        node_key = str(node)
+        in_deg = float(G.in_degree(node))
+        out_deg = float(G.out_degree(node))
+        neigh = set(str(n) for n in G.predecessors(node)).union(str(n) for n in G.successors(node))
+
+        if neigh:
+            neighbor_flags = [float(flag_map.get(n, 0.0)) for n in neigh]
+            neighbor_deg = [float(deg_map.get(n, 0.0)) for n in neigh]
+            neighbor_fraud_ratio = float(np.mean(neighbor_flags))
+            neighbor_degree_mean = float(np.mean(neighbor_deg))
+        else:
+            neighbor_fraud_ratio = 0.0
+            neighbor_degree_mean = 0.0
+
+        rows.append(
+            {
+                "node_id": node_key,
+                "neighbor_fraud_ratio": neighbor_fraud_ratio,
+                "neighbor_degree_mean": neighbor_degree_mean,
+                "in_out_ratio": float(in_deg / (out_deg + 1e-6)),
+                "is_bridge": float(1.0 if node in bridges else 0.0),
+                "local_efficiency": _local_efficiency_from_neighbors(undirected, node),
+            }
+        )
+
+    return pd.DataFrame(rows)
+
+
+def _correlation_report(features_df):
+    """Log feature-label correlations against ground truth labels when available."""
+    gt_path = config.ACCOUNT_GROUND_TRUTH_PATH
+    if not os.path.exists(gt_path):
+        logger.warning("Ground truth file not found for correlation report: %s", gt_path)
+        return
+
+    gt = pd.read_csv(gt_path)
+    if "account_id" not in gt.columns or "is_fraud" not in gt.columns:
+        logger.warning("Ground truth file missing account_id/is_fraud columns")
+        return
+
+    gt = gt[["account_id", "is_fraud"]].copy()
+    gt["account_id"] = gt["account_id"].astype(str)
+    gt["is_fraud"] = pd.to_numeric(gt["is_fraud"], errors="coerce").fillna(-1).astype(int)
+
+    merged = features_df.merge(gt, left_on="node_id", right_on="account_id", how="left")
+    merged = merged[merged["is_fraud"] >= 0].copy()
+    if merged.empty:
+        logger.warning("No labeled rows available for correlation report")
+        return
+
+    corr_rows = []
+    numeric_cols = [c for c in features_df.columns if c != "node_id"]
+    for col in numeric_cols:
+        x = pd.to_numeric(merged[col], errors="coerce")
+        if x.notna().sum() < 3:
+            continue
+        corr = float(x.corr(merged["is_fraud"]))
+        if np.isfinite(corr):
+            corr_rows.append((col, corr))
+
+    corr_rows.sort(key=lambda t: abs(t[1]), reverse=True)
+    logger.info("Feature correlation with ground truth labels (top 15 by |corr|):")
+    for col, corr in corr_rows[:15]:
+        logger.info("  %-24s corr=%.6f", col, corr)
+
+
+def compute_features(G, use_dynamic=False, transactions_df=None):
+    """Compute canonical and upgraded AML features for each node."""
+    logger.info("Computing AML feature matrix...")
+
+    nodes = [str(n) for n in sorted(G.nodes())]
+
+    if use_dynamic and transactions_df is not None:
+        from src.dynamic_graph import DynamicFraudGraph
+
+        logger.info("Using dynamic feature path for canonical structural base")
+        dg = DynamicFraudGraph(window_size=7)
+        tx_in = _coerce_transactions(transactions_df)
+        if tx_in is not None:
+            for row in tx_in.itertuples(index=False):
+                dg.add_transaction(row.sender_id, row.receiver_id, float(row.amount), int(row.timestamp_int))
+
+        base_df = dg.get_all_features()
+        if base_df.empty:
+            base_df = _compute_base_features_cpp_or_nx(G)
+    else:
+        base_df = _compute_base_features_cpp_or_nx(G)
+
+    base_df["node_id"] = base_df["node_id"].astype(str)
+    base_df = pd.DataFrame({"node_id": nodes}).merge(base_df, on="node_id", how="left")
+    for c in CANONICAL_FEATURE_COLUMNS:
+        base_df[c] = pd.to_numeric(base_df[c], errors="coerce").fillna(0.0)
+
+    tx = _coerce_transactions(transactions_df)
+    temporal_df = _compute_temporal_features(nodes, tx)
+    ego_topo_df = _compute_ego_topological_features(G, base_df)
+
+    full_df = base_df.merge(temporal_df, on="node_id", how="left")
+    full_df = full_df.merge(ego_topo_df, on="node_id", how="left")
+
+    for c in FULL_FEATURE_COLUMNS:
+        full_df[c] = pd.to_numeric(full_df[c], errors="coerce").fillna(0.0)
+
+    nan_count = int(full_df.isna().sum().sum())
+
+    config.ensure_dirs()
+    full_path = os.path.join(config.PROCESSED_DATA_DIR, "node_features_full.csv")
+    full_df.to_csv(full_path, index=False)
+
+    # Keep existing downstream compatibility path.
+    full_df.to_csv(config.NODE_FEATURES_PATH, index=False)
+
+    logger.info("Saved full feature matrix: %s", full_path)
+    logger.info("Saved compatibility feature matrix: %s", config.NODE_FEATURES_PATH)
+    logger.info("Feature matrix shape: %s", tuple(full_df.shape))
+    logger.info("Total NaN count: %d", nan_count)
+
+    _correlation_report(full_df)
+
+    return full_df
 
 
 if __name__ == "__main__":
     import sys
+
     sys.path.insert(0, ".")
-    from src.data_loader import load_data, build_graph, set_seeds
+    from src.data_loader import build_graph, load_data, set_seeds
 
     set_seeds()
     config.ensure_dirs()
 
-    df, account_labels = load_data()
+    df, _ = load_data()
     G = build_graph(df)
-    features_df = compute_features(G)
+    features_df = compute_features(G, transactions_df=df)
 
-    logger.info("\n✅ Feature engineering standalone test complete!")
-    logger.info("  Shape: %s", features_df.shape)
-    print(features_df.head(10).to_string())
+    logger.info("Feature engineering complete")
+    logger.info("Shape: %s", features_df.shape)
 
 
 # Backward-compatible aliases.
 compute_clustering_coefficient = compute_clustering
-compute_betweenness_centrality = compute_betweenness
 compute_all_features = compute_features

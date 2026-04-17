@@ -10,8 +10,8 @@ Scoring intuition:
   - High PageRank → suspicious (central node receiving many flows)
 
 The scoring function is:
-  fraud_score(node) = w1 * normalize(total_degree)
-                    + w2 * (1 - normalize(clustering_coefficient))
+    fraud_score(node) = w1 * normalize(degree)
+                                        + w2 * (1 - normalize(clustering))
                     + w3 * normalize(pagerank)
 
 where weights w1, w2, w3 are loaded from config.py.
@@ -48,13 +48,13 @@ def compute_fraud_scores(features_df):
     Compute a heuristic fraud score for each node based on graph features.
 
     The score combines three normalized features with configurable weights:
-      - w1 * norm(total_degree): high degree → suspicious hub
+            - w1 * norm(degree): high degree → suspicious hub
       - w2 * (1 - norm(clustering)): low clustering → suspicious broker/mule
       - w3 * norm(pagerank): high PageRank → suspicious central node
 
     Args:
         features_df (pd.DataFrame): Node features with columns:
-            node_id, total_degree, clustering_coefficient, pagerank
+            node_id, degree, clustering, pagerank
 
     Returns:
         pd.DataFrame: Features augmented with 'fraud_score' column,
@@ -69,9 +69,13 @@ def compute_fraud_scores(features_df):
 
     df = features_df.copy()
 
+    # Handle legacy feature exports while preferring canonical names.
+    degree_col = "degree" if "degree" in df.columns else "total_degree"
+    clustering_col = "clustering" if "clustering" in df.columns else "clustering_coefficient"
+
     # Normalize features
-    norm_degree = normalize_series(df["total_degree"])
-    norm_clustering = normalize_series(df["clustering_coefficient"])
+    norm_degree = normalize_series(df[degree_col])
+    norm_clustering = normalize_series(df[clustering_col])
     norm_pagerank = normalize_series(df["pagerank"])
 
     # Compute fraud score
@@ -150,17 +154,26 @@ def evaluate_heuristic(labels_df, ground_truth_labels):
     """
     logger.info("Evaluating heuristic labels against ground truth...")
 
-    # Align labels
+    # Align labels, ignoring unlabeled ground-truth nodes (label=-1).
     y_true = []
     y_pred = []
     for _, row in labels_df.iterrows():
-        node_id = int(row["node_id"])
-        if node_id in ground_truth_labels:
-            y_true.append(ground_truth_labels[node_id])
+        node_id = str(row["node_id"])
+        if node_id in ground_truth_labels and int(ground_truth_labels[node_id]) != -1:
+            y_true.append(int(ground_truth_labels[node_id]))
             y_pred.append(int(row["heuristic_label"]))
 
     y_true = np.array(y_true)
     y_pred = np.array(y_pred)
+
+    if y_true.size == 0:
+        logger.warning("  No labeled nodes available for heuristic evaluation")
+        return {
+            "accuracy": 0.0,
+            "precision": 0.0,
+            "recall": 0.0,
+            "f1": 0.0,
+        }
 
     metrics = {
         "accuracy": accuracy_score(y_true, y_pred),

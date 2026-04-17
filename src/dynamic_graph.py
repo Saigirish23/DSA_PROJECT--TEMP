@@ -1,217 +1,165 @@
-"""Dynamic graph data structures for incremental fraud feature updates."""
+"""Dynamic graph data structures for snapshot-based feature computation."""
 
 from collections import defaultdict, deque
 
+import networkx as nx
 import pandas as pd
 
 
-class IncrementalAdjacencyList:
-    """
-    Dynamic adjacency list that updates degree counts incrementally.
-    Adding edge (u,v): O(1) amortized
-    Degree query: O(1)
-    vs static rebuild: O(V+E) each time
-    """
-
-    def __init__(self):
-        self.out_edges = defaultdict(set)  # u -> set of v
-        self.in_edges = defaultdict(set)  # v -> set of u
-        self.out_degree = defaultdict(int)
-        self.in_degree = defaultdict(int)
-
-    def add_edge(self, u, v):
-        if v not in self.out_edges[u]:
-            self.out_edges[u].add(v)
-            self.in_edges[v].add(u)
-            self.out_degree[u] += 1
-            self.in_degree[v] += 1
-
-    def remove_edge(self, u, v):
-        if v in self.out_edges[u]:
-            self.out_edges[u].discard(v)
-            self.in_edges[v].discard(u)
-            self.out_degree[u] -= 1
-            self.in_degree[v] -= 1
-
-    def get_degree(self, node):
-        return self.out_degree[node] + self.in_degree[node]
-
-    def get_neighbors(self, node):
-        return self.out_edges[node] | self.in_edges[node]
-
-
-class FenwickTree:
-    """
-    Fenwick Tree for O(log n) prefix sum queries on transaction amounts.
-    Used for temporal aggregation: 'total amount in last T time steps'
-    Point update: O(log n)  vs  O(n) naive scan
-    Range query:  O(log n)  vs  O(n) naive scan
-    """
-
-    def __init__(self, size):
-        self.n = size
-        self.tree = [0.0] * (size + 1)
-
-    def update(self, i, delta):
-        # add delta at position i (0-indexed API)
-        i += 1
-        while i <= self.n:
-            self.tree[i] += delta
-            i += i & (-i)
-
-    def query(self, i):
-        # prefix sum [0..i]
-        i += 1
-        total = 0.0
-        while i > 0:
-            total += self.tree[i]
-            i -= i & (-i)
-        return total
-
-    def range_query(self, l, r):
-        # sum in range [l..r]
-        if r < l:
-            return 0.0
-        if l == 0:
-            return self.query(r)
-        return self.query(r) - self.query(l - 1)
-
-
-class SlidingWindowGraph:
-    """
-    Maintains a graph over a fixed time window [t - W, t].
-    Old edges expire automatically when they fall outside the window.
-    Uses a deque for O(1) expiry.
-    """
-
-    def __init__(self, window_size):
-        self.window = window_size
-        self.adj = IncrementalAdjacencyList()
-        self.history = deque()  # (timestamp, u, v)
-
-    def add_transaction(self, u, v, timestamp):
-        self.adj.add_edge(u, v)
-        self.history.append((timestamp, u, v))
-        self._expire(timestamp)
-
-    def _expire(self, current_time):
-        while self.history and self.history[0][0] < current_time - self.window:
-            _, u, v = self.history.popleft()
-            self.adj.remove_edge(u, v)
-
-    def get_degree(self, node):
-        return self.adj.get_degree(node)
-
-
-class IncrementalPageRank:
-    """
-    Approximates PageRank update after edge addition without full recomputation.
-    """
-
-    def __init__(self, damping=0.85, max_iter=10):
-        self.d = damping
-        self.max_iter = max_iter
-        self.ranks = defaultdict(float)
-        self.adj = IncrementalAdjacencyList()
-
-    def add_edge(self, u, v):
-        self.adj.add_edge(u, v)
-        self._local_update(u, v)
-
-    def _local_update(self, u, v):
-        affected = {u, v} | self.adj.get_neighbors(u) | self.adj.get_neighbors(v)
-        n = max(len(self.ranks), 1)
-
-        for _ in range(self.max_iter):
-            for node in affected:
-                incoming = self.adj.in_edges[node]
-                rank_sum = sum(
-                    self.ranks[src] / max(self.adj.out_degree[src], 1) for src in incoming
-                )
-                self.ranks[node] = (1 - self.d) / n + self.d * rank_sum
-
-    def get_rank(self, node):
-        return self.ranks.get(node, 1.0 / max(len(self.ranks), 1))
-
-
-class IncrementalClustering:
-    """
-    Maintains approximate clustering coefficients incrementally.
-    """
-
-    def __init__(self):
-        self.adj = defaultdict(set)
-        self.triangles = defaultdict(int)
-        self.clustering = defaultdict(float)
-
-    def add_edge(self, u, v):
-        common = self.adj[u] & self.adj[v]
-        new_triangles = len(common)
-
-        self.triangles[u] += new_triangles
-        self.triangles[v] += new_triangles
-        for w in common:
-            self.triangles[w] += 1
-
-        self.adj[u].add(v)
-        self.adj[v].add(u)
-        self._update_cc(u)
-        self._update_cc(v)
-
-    def _update_cc(self, node):
-        d = len(self.adj[node])
-        if d < 2:
-            self.clustering[node] = 0.0
-        else:
-            self.clustering[node] = (2 * self.triangles[node]) / (d * (d - 1))
-
-    def get_clustering(self, node):
-        return self.clustering.get(node, 0.0)
+CANONICAL_FEATURE_COLUMNS = ["degree", "in_degree", "out_degree", "clustering", "pagerank"]
 
 
 class DynamicFraudGraph:
     """
-    Unified dynamic graph combining incremental structures for streaming features.
+    Dynamic graph with O(1) per-edge structural updates.
+
+    Edge updates only maintain window structure and degree counters.
+    Snapshot math (PageRank + clustering) is computed once per snapshot.
     """
 
     def __init__(self, window_size=7):
-        self.window_graph = SlidingWindowGraph(window_size)
-        self.inc_pagerank = IncrementalPageRank()
-        self.inc_clustering = IncrementalClustering()
-        self.fenwick_trees = {}  # node -> FenwickTree for amounts
-        self.time_slots = 100
+        self.window = int(window_size)
+        self.active_graph = nx.DiGraph()
+
+        # Multiplicity map avoids repeated-edge expiry bugs in sliding windows.
+        self.edge_counts = defaultdict(int)  # (u, v) -> multiplicity
+
+        # O(1) degree lookups for feature extraction.
+        self.in_degree = defaultdict(int)
+        self.out_degree = defaultdict(int)
+
+        # Transaction history for expiry: (timestamp, u, v)
+        self.history = deque()
+        self.current_time = None
+
+        # Snapshot-level metrics (recomputed lazily or explicitly).
+        self.current_pagerank = {}
+        self.current_clustering = {}
+        self._snapshot_dirty = True
+
+    def _increment_edge(self, u, v):
+        """Add one edge copy; update topology and degrees only on first copy."""
+        key = (u, v)
+        prev = self.edge_counts[key]
+        self.edge_counts[key] = prev + 1
+
+        if prev == 0:
+            self.active_graph.add_edge(u, v)
+            self.out_degree[u] += 1
+            self.in_degree[v] += 1
+
+    def _decrement_edge(self, u, v):
+        """Remove one edge copy; update topology and degrees when last copy expires."""
+        key = (u, v)
+        count = self.edge_counts.get(key, 0)
+        if count <= 0:
+            return
+
+        if count == 1:
+            del self.edge_counts[key]
+
+            if self.active_graph.has_edge(u, v):
+                self.active_graph.remove_edge(u, v)
+
+            if self.out_degree.get(u, 0) > 0:
+                self.out_degree[u] -= 1
+                if self.out_degree[u] == 0:
+                    del self.out_degree[u]
+
+            if self.in_degree.get(v, 0) > 0:
+                self.in_degree[v] -= 1
+                if self.in_degree[v] == 0:
+                    del self.in_degree[v]
+
+            # Trim isolated nodes to keep snapshot computations compact.
+            if self.active_graph.has_node(u):
+                if self.active_graph.in_degree(u) == 0 and self.active_graph.out_degree(u) == 0:
+                    self.active_graph.remove_node(u)
+            if self.active_graph.has_node(v):
+                if self.active_graph.in_degree(v) == 0 and self.active_graph.out_degree(v) == 0:
+                    self.active_graph.remove_node(v)
+        else:
+            self.edge_counts[key] = count - 1
+
+    def _expire(self, current_time):
+        threshold = int(current_time) - self.window
+        while self.history and self.history[0][0] < threshold:
+            _, u, v = self.history.popleft()
+            self._decrement_edge(u, v)
 
     def add_transaction(self, sender, receiver, amount, timestamp):
-        self.window_graph.add_transaction(sender, receiver, timestamp)
-        self.inc_pagerank.add_edge(sender, receiver)
-        self.inc_clustering.add_edge(sender, receiver)
+        """O(1) structural update for one transaction event."""
+        del amount  # Amount is not needed for structural snapshot features.
 
-        slot = int(timestamp % self.time_slots)
-        for node in [sender, receiver]:
-            if node not in self.fenwick_trees:
-                self.fenwick_trees[node] = FenwickTree(self.time_slots)
-            self.fenwick_trees[node].update(slot, amount)
+        u = str(sender)
+        v = str(receiver)
+        if u == v:
+            return
+
+        ts = int(timestamp)
+        if self.current_time is None or ts > self.current_time:
+            self.current_time = ts
+
+        self._increment_edge(u, v)
+        self.history.append((ts, u, v))
+        self._expire(self.current_time)
+        self._snapshot_dirty = True
+
+    def remove_transaction(self, sender, receiver):
+        """Explicit structural edge removal by one transaction copy."""
+        u = str(sender)
+        v = str(receiver)
+        self._decrement_edge(u, v)
+        self._snapshot_dirty = True
+
+    def calculate_snapshot_pagerank(self):
+        """Compute snapshot metrics once from current active window graph."""
+        if self.active_graph.number_of_nodes() == 0:
+            self.current_pagerank = {}
+            self.current_clustering = {}
+            self._snapshot_dirty = False
+            return self.current_pagerank
+
+        try:
+            self.current_pagerank = nx.pagerank(self.active_graph, alpha=0.85)
+        except Exception:
+            # Safe fallback if power iteration fails.
+            n = self.active_graph.number_of_nodes()
+            uniform = 1.0 / float(n) if n else 0.0
+            self.current_pagerank = {node: uniform for node in self.active_graph.nodes()}
+
+        try:
+            self.current_clustering = nx.clustering(self.active_graph.to_undirected())
+        except Exception:
+            self.current_clustering = {}
+
+        self._snapshot_dirty = False
+        return self.current_pagerank
 
     def get_features(self, node):
-        degree = self.window_graph.get_degree(node)
-        clustering = self.inc_clustering.get_clustering(node)
-        pagerank = self.inc_pagerank.get_rank(node)
+        node = str(node)
+        in_deg = int(self.in_degree.get(node, 0))
+        out_deg = int(self.out_degree.get(node, 0))
+        degree = in_deg + out_deg
+
         return {
-            "node_id": str(node),
-            "in_degree": 0,
-            "out_degree": 0,
-            "total_degree": degree,
-            "clustering_coefficient": clustering,
-            "pagerank": pagerank,
-            "betweenness_centrality": 0.0,
+            "node_id": node,
             "degree": degree,
-            "clustering": clustering,
-            "betweenness": 0.0,
+            "in_degree": in_deg,
+            "out_degree": out_deg,
+            "clustering": float(self.current_clustering.get(node, 0.0)),
+            "pagerank": float(self.current_pagerank.get(node, 0.0)),
         }
 
     def get_all_features(self):
-        all_nodes = set(self.window_graph.adj.out_degree.keys()) | set(
-            self.window_graph.adj.in_degree.keys()
-        )
+        # Safety net for direct callers that did not invoke snapshot compute explicitly.
+        if self._snapshot_dirty:
+            self.calculate_snapshot_pagerank()
+
+        all_nodes = set(self.active_graph.nodes()) | set(self.in_degree.keys()) | set(self.out_degree.keys())
         rows = [self.get_features(n) for n in sorted(all_nodes)]
-        return pd.DataFrame(rows)
+        if not rows:
+            return pd.DataFrame(columns=["node_id"] + CANONICAL_FEATURE_COLUMNS)
+
+        features_df = pd.DataFrame(rows)
+        return features_df[["node_id"] + CANONICAL_FEATURE_COLUMNS]

@@ -19,7 +19,7 @@ Both strategies are compared against the standalone heuristic and GNN baselines.
 import numpy as np
 import pandas as pd
 import torch
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score, average_precision_score
 from sklearn.preprocessing import StandardScaler
 
 import config
@@ -29,9 +29,28 @@ from src.data_loader import set_seeds
 logger = config.setup_logging(__name__)
 
 
+def _safe_roc_auc(y_true, y_prob):
+    """Compute ROC-AUC safely for potentially single-class slices."""
+    y_true = np.asarray(y_true)
+    y_prob = np.asarray(y_prob)
+    if len(np.unique(y_true)) < 2:
+        return 0.5
+    return float(roc_auc_score(y_true, y_prob))
+
+
+def _safe_pr_auc(y_true, y_prob):
+    """Compute PR-AUC safely for potentially single-class slices."""
+    y_true = np.asarray(y_true)
+    y_prob = np.asarray(y_prob)
+    if len(np.unique(y_true)) < 2:
+        return float(y_true.mean()) if len(y_true) else 0.0
+    return float(average_precision_score(y_true, y_prob))
+
+
 def _verify_labels_are_ground_truth(data):
     """Guardrail against evaluating against heuristic-derived labels."""
     y = data.y.detach().cpu().numpy()
+    y = y[y != -1]
     fraud_ratio = float(y.mean()) if len(y) else 0.0
     assert 0.03 <= fraud_ratio <= 0.30, (
         "LABEL LEAKAGE RISK: Fraud ratio {:.2%} is suspicious. "
@@ -61,6 +80,7 @@ def strategy_a_feature_augmentation(G, features_df, labels_series, fraud_scores,
     """
     from torch_geometric.data import Data
     from sklearn.model_selection import train_test_split
+    from src.train import train_model, get_gnn_predictions
 
     logger.info("=" * 60)
     logger.info("Strategy A: Feature Augmentation (heuristic score as input feature)")
@@ -98,25 +118,34 @@ def strategy_a_feature_augmentation(G, features_df, labels_series, fraud_scores,
     edge_index = torch.tensor(edge_list, dtype=torch.long).t().contiguous()
 
     # Labels
-    y = torch.zeros(num_nodes, dtype=torch.long)
+    y = torch.full((num_nodes,), -1, dtype=torch.long)
     for node_id, label in labels_series.items():
         node_key = str(node_id)
         if node_key in node_to_idx:
             y[node_to_idx[node_key]] = int(label)
 
+    labeled_mask = y != -1
+    labeled_idx = np.where(labeled_mask.numpy())[0]
+    if len(labeled_idx) < 3:
+        raise ValueError("Not enough labeled nodes to run Strategy A split")
+
     # Match reference-style split: 70/30 then 80/20 on train.
-    indices = np.arange(num_nodes)
+    indices = labeled_idx
+    stratify_targets = y.numpy()[indices]
+    stratify_targets = stratify_targets if len(np.unique(stratify_targets)) > 1 else None
     train_idx, test_idx = train_test_split(
         indices,
         test_size=0.3,
-        stratify=y.numpy(), random_state=config.RANDOM_SEED
+        stratify=stratify_targets,
+        random_state=config.RANDOM_SEED,
     )
 
     train_labels = y.numpy()[train_idx]
+    stratify_train = train_labels if len(np.unique(train_labels)) > 1 else None
     tr_rel_idx, val_rel_idx = train_test_split(
         np.arange(len(train_idx)),
         test_size=0.2,
-        stratify=train_labels,
+        stratify=stratify_train,
         random_state=config.RANDOM_SEED,
     )
     val_idx = train_idx[val_rel_idx]
@@ -144,81 +173,23 @@ def strategy_a_feature_augmentation(G, features_df, labels_series, fraud_scores,
     data = Data(x=x, edge_index=edge_index, y=y,
                 train_mask=train_mask, val_mask=val_mask, test_mask=test_mask)
 
-    # Train augmented GCN (num_features = original + 1)
-    data = data.to(device)
-    model = FraudGCN(num_features=x.shape[1]).to(device)
-
-    optimizer = torch.optim.Adam(
-        model.parameters(), lr=config.LEARNING_RATE, weight_decay=config.WEIGHT_DECAY
-    )
-
-    # Class weights
-    train_labels = y[train_mask].numpy()
-    class_counts = np.bincount(train_labels, minlength=config.GNN_NUM_CLASSES)
-    total = class_counts.sum()
-    weights = total / (len(class_counts) * class_counts + 1e-8)
-    class_weights = torch.tensor(weights, dtype=torch.float32).to(device)
-    criterion = torch.nn.CrossEntropyLoss(weight=class_weights)
-
-    # Training loop
-    history = {"train_loss": [], "val_f1": [], "test_f1": []}
-    best_f1 = 0.0
-    best_state = model.state_dict().copy()
-
-    for epoch in range(1, config.NUM_EPOCHS + 1):
-        model.train()
-        optimizer.zero_grad()
-        out = model(data.x, data.edge_index)
-        loss = criterion(out[data.train_mask], data.y[data.train_mask])
-        loss.backward()
-        optimizer.step()
-
-        model.eval()
-        with torch.no_grad():
-            out = model(data.x, data.edge_index)
-            pred = out.argmax(dim=1)
-            val_f1 = f1_score(
-                data.y[data.val_mask].cpu().numpy(),
-                pred[data.val_mask].cpu().numpy(),
-                zero_division=0
-            )
-            test_f1 = f1_score(
-                data.y[data.test_mask].cpu().numpy(),
-                pred[data.test_mask].cpu().numpy(),
-                zero_division=0
-            )
-
-        history["train_loss"].append(loss.item())
-        history["val_f1"].append(val_f1)
-        history["test_f1"].append(test_f1)
-
-        if val_f1 > best_f1:
-            best_f1 = val_f1
-            best_state = model.state_dict().copy()
-
-        if epoch % config.LOG_INTERVAL == 0:
-            logger.info("  Epoch %3d/%d | Loss: %.4f | Test F1: %.4f",
-                        epoch, config.NUM_EPOCHS, loss.item(), test_f1)
-
-    # Load best model
-    model.load_state_dict(best_state)
-    model.eval()
-
-    with torch.no_grad():
-        out = model(data.x, data.edge_index)
-        probs = torch.softmax(out, dim=1).cpu()
-        preds = out.argmax(dim=1).cpu()
+    # Train augmented GNN with memory-safe minibatching.
+    model, history = train_model(data, device=device)
+    preds, probs = get_gnn_predictions(model, data, device=device)
 
     # Compute metrics on test set
-    y_true = y[test_mask].numpy()
-    y_pred = preds[test_mask].numpy()
+    test_eval_mask = (data.test_mask & (data.y != -1)).cpu().numpy()
+    y_true = y.cpu().numpy()[test_eval_mask]
+    y_pred = preds.cpu().numpy()[test_eval_mask]
+    y_prob = probs.cpu().numpy()[test_eval_mask, 1]
 
     metrics = {
         "accuracy": accuracy_score(y_true, y_pred),
         "precision": precision_score(y_true, y_pred, zero_division=0),
         "recall": recall_score(y_true, y_pred, zero_division=0),
         "f1": f1_score(y_true, y_pred, zero_division=0),
-        "roc_auc": roc_auc_score(y_true, probs[:, 1].numpy()[test_mask.numpy()]),
+        "roc_auc": _safe_roc_auc(y_true, y_prob),
+        "pr_auc": _safe_pr_auc(y_true, y_prob),
     }
 
     logger.info("  Strategy A Results:")
@@ -228,40 +199,44 @@ def strategy_a_feature_augmentation(G, features_df, labels_series, fraud_scores,
     return preds, probs, metrics, model, history
 
 
-def strategy_b_late_fusion(gnn_probs, heuristic_scores, labels, test_mask):
+def strategy_b_late_fusion(gnn_probs, heuristic_scores, labels, val_mask, test_mask):
     """
     Strategy B: Late Fusion — weighted average of GNN and heuristic scores.
 
-    Sweeps alpha from 0 to 1:
+    Sweeps alpha from 0 to 1 and, for each alpha, sweeps decision threshold
+    on validation data to select the best operating point:
         final_score = α × GNN_fraud_prob + (1 - α) × heuristic_score
-        If final_score > 0.5 → predict fraud
+        If final_score > threshold → predict fraud
 
     Args:
         gnn_probs (torch.Tensor): GNN probabilities [N, 2].
         heuristic_scores (np.ndarray or torch.Tensor): Heuristic fraud scores [N].
         labels (torch.Tensor): Ground truth labels [N].
+        val_mask (torch.Tensor): Boolean mask for validation nodes.
         test_mask (torch.Tensor): Boolean mask for test nodes.
 
     Returns:
-        tuple: (best_alpha, best_metrics, all_results_df)
+        tuple: (best_alpha, best_threshold, best_test_metrics, all_results_df)
     """
     logger.info("=" * 60)
     logger.info("Strategy B: Late Fusion (sweep α from 0.0 to 1.0)")
     logger.info("=" * 60)
 
-    fraud_ratio = float(labels.float().mean().item()) if len(labels) else 0.0
+    labels_np = labels.detach().cpu().numpy()
+    labeled_mask_np = labels_np != -1
+    fraud_ratio = float(labels_np[labeled_mask_np].mean()) if labeled_mask_np.any() else 0.0
     assert 0.03 <= fraud_ratio <= 0.30, (
         "LABEL LEAKAGE RISK: Fraud ratio {:.2%} is suspicious. "
         "Verify labels are true ground truth".format(fraud_ratio)
     )
 
     if isinstance(heuristic_scores, torch.Tensor):
-        h_scores = heuristic_scores.float().numpy()
+        h_scores = heuristic_scores.detach().cpu().float().numpy()
     else:
         h_scores = np.array(heuristic_scores, dtype=np.float32)
 
     # GNN fraud probability (class 1)
-    gnn_fraud_prob = gnn_probs[:, 1].numpy()
+    gnn_fraud_prob = gnn_probs[:, 1].detach().cpu().numpy()
 
     # Normalize heuristic scores to [0, 1]
     h_min, h_max = h_scores.min(), h_scores.max()
@@ -270,7 +245,19 @@ def strategy_b_late_fusion(gnn_probs, heuristic_scores, labels, test_mask):
     else:
         h_scores_norm = h_scores
 
-    y_true = labels[test_mask].numpy()
+    val_mask_np = val_mask.detach().cpu().numpy()
+    test_mask_np = test_mask.detach().cpu().numpy()
+    eval_val_mask_np = val_mask_np & labeled_mask_np
+    eval_test_mask_np = test_mask_np & labeled_mask_np
+
+    y_val_true = labels_np[eval_val_mask_np]
+    y_test_true = labels_np[eval_test_mask_np]
+
+    if y_val_true.size == 0:
+        raise ValueError("No labeled validation nodes available for late fusion selection")
+    if y_test_true.size == 0:
+        raise ValueError("No labeled test nodes available for late fusion evaluation")
+
     results = []
 
     alphas = np.arange(
@@ -278,36 +265,79 @@ def strategy_b_late_fusion(gnn_probs, heuristic_scores, labels, test_mask):
         config.ALPHA_SWEEP_END + config.ALPHA_SWEEP_STEP / 2,
         config.ALPHA_SWEEP_STEP
     )
+    threshold_grid = np.arange(0.10, 0.95 + 0.001, 0.05)
 
     for alpha in alphas:
         # Blend scores
         final_score = alpha * gnn_fraud_prob + (1 - alpha) * h_scores_norm
-        y_pred = (final_score[test_mask.numpy()] > 0.5).astype(int)
+        val_score = final_score[eval_val_mask_np]
+        test_score = final_score[eval_test_mask_np]
+
+        best_thr = 0.50
+        best_val_f1 = -1.0
+        best_val_precision = 0.0
+        best_val_recall = 0.0
+
+        for thr in threshold_grid:
+            y_val_pred = (val_score > thr).astype(int)
+            val_f1 = f1_score(y_val_true, y_val_pred, zero_division=0)
+            val_precision = precision_score(y_val_true, y_val_pred, zero_division=0)
+            val_recall = recall_score(y_val_true, y_val_pred, zero_division=0)
+            if (val_f1 > best_val_f1) or (
+                np.isclose(val_f1, best_val_f1) and val_precision > best_val_precision
+            ):
+                best_val_f1 = val_f1
+                best_val_precision = val_precision
+                best_val_recall = val_recall
+                best_thr = float(thr)
+
+        y_test_pred = (test_score > best_thr).astype(int)
 
         metrics = {
-            "alpha": round(alpha, 1),
-            "accuracy": accuracy_score(y_true, y_pred),
-            "precision": precision_score(y_true, y_pred, zero_division=0),
-            "recall": recall_score(y_true, y_pred, zero_division=0),
-            "f1": f1_score(y_true, y_pred, zero_division=0),
-            "roc_auc": roc_auc_score(y_true, final_score[test_mask.numpy()]),
+            "alpha": round(float(alpha), 2),
+            "threshold": round(float(best_thr), 2),
+            "val_precision": best_val_precision,
+            "val_recall": best_val_recall,
+            "val_f1": best_val_f1,
+            "val_roc_auc": _safe_roc_auc(y_val_true, val_score),
+            "val_pr_auc": _safe_pr_auc(y_val_true, val_score),
+            "accuracy": accuracy_score(y_test_true, y_test_pred),
+            "precision": precision_score(y_test_true, y_test_pred, zero_division=0),
+            "recall": recall_score(y_test_true, y_test_pred, zero_division=0),
+            "f1": f1_score(y_test_true, y_test_pred, zero_division=0),
+            "roc_auc": _safe_roc_auc(y_test_true, test_score),
+            "pr_auc": _safe_pr_auc(y_test_true, test_score),
         }
         results.append(metrics)
-        logger.info("  α=%.1f | Acc: %.4f | P: %.4f | R: %.4f | F1: %.4f",
-                     alpha, metrics["accuracy"], metrics["precision"],
-                     metrics["recall"], metrics["f1"])
+        logger.info(
+            "  α=%.2f | thr*=%.2f | Val F1: %.4f | Test Acc: %.4f | Test P: %.4f | Test R: %.4f | Test F1: %.4f",
+            alpha,
+            best_thr,
+            best_val_f1,
+            metrics["accuracy"],
+            metrics["precision"],
+            metrics["recall"],
+            metrics["f1"],
+        )
 
     results_df = pd.DataFrame(results)
 
-    # Find best alpha by F1
-    best_idx = results_df["f1"].idxmax()
+    # Select alpha + threshold by validation objective, then report test metrics.
+    best_idx = results_df.sort_values(["val_f1", "val_pr_auc"], ascending=False).index[0]
     best_alpha = results_df.loc[best_idx, "alpha"]
+    best_threshold = results_df.loc[best_idx, "threshold"]
     best_metrics = results_df.loc[best_idx].to_dict()
 
     logger.info("-" * 60)
-    logger.info("  Best α = %.1f | F1 = %.4f", best_alpha, best_metrics["f1"])
+    logger.info(
+        "  Selected α = %.2f | threshold = %.2f | Val F1 = %.4f | Test F1 = %.4f",
+        best_alpha,
+        best_threshold,
+        best_metrics["val_f1"],
+        best_metrics["f1"],
+    )
 
-    return best_alpha, best_metrics, results_df
+    return best_alpha, best_threshold, best_metrics, results_df
 
 
 def run_hybrid_comparison(G, features_df, labels_df, data, model, device="cpu"):
@@ -341,11 +371,15 @@ def run_hybrid_comparison(G, features_df, labels_df, data, model, device="cpu"):
     fraud_scores = labels_df.set_index("node_id")["fraud_score"]
 
     # --- Heuristic Only ---
+    labels_np = data.y.cpu().numpy()
     test_mask_np = data.test_mask.cpu().numpy()
+    eval_mask_np = test_mask_np & (labels_np != -1)
+    if eval_mask_np.sum() == 0:
+        raise ValueError("No labeled nodes in test split for hybrid comparison")
     nodes = sorted(G.nodes())
     node_to_idx = {node: idx for idx, node in enumerate(nodes)}
 
-    y_true_test = data.y[data.test_mask].cpu().numpy()
+    y_true_test = labels_np[eval_mask_np]
 
     # Build heuristic scores aligned with node ordering
     h_scores_aligned = np.zeros(len(nodes), dtype=np.float32)
@@ -358,7 +392,7 @@ def run_hybrid_comparison(G, features_df, labels_df, data, model, device="cpu"):
     for node in nodes:
         if node in node_to_idx:
             idx = node_to_idx[node]
-            if data.test_mask[idx]:
+            if eval_mask_np[idx]:
                 h_preds_test.append(int(heuristic_series.get(node, 0)))
     h_preds_test = np.array(h_preds_test)
 
@@ -367,20 +401,22 @@ def run_hybrid_comparison(G, features_df, labels_df, data, model, device="cpu"):
         "precision": precision_score(y_true_test, h_preds_test, zero_division=0),
         "recall": recall_score(y_true_test, h_preds_test, zero_division=0),
         "f1": f1_score(y_true_test, h_preds_test, zero_division=0),
-        "roc_auc": roc_auc_score(y_true_test, h_scores_aligned[test_mask_np]),
+        "roc_auc": _safe_roc_auc(y_true_test, h_scores_aligned[eval_mask_np]),
+        "pr_auc": _safe_pr_auc(y_true_test, h_scores_aligned[eval_mask_np]),
     }
 
     # --- GNN Only ---
     gnn_preds, gnn_probs = get_gnn_predictions(model, data, device)
-    y_pred_gnn = gnn_preds[data.test_mask.cpu()].numpy()
-    gnn_probs_test = gnn_probs[data.test_mask.cpu()][:, 1].numpy()
+    y_pred_gnn = gnn_preds.numpy()[eval_mask_np]
+    gnn_probs_test = gnn_probs.numpy()[eval_mask_np, 1]
 
     gnn_metrics = {
         "accuracy": accuracy_score(y_true_test, y_pred_gnn),
         "precision": precision_score(y_true_test, y_pred_gnn, zero_division=0),
         "recall": recall_score(y_true_test, y_pred_gnn, zero_division=0),
         "f1": f1_score(y_true_test, y_pred_gnn, zero_division=0),
-        "roc_auc": roc_auc_score(y_true_test, gnn_probs_test),
+        "roc_auc": _safe_roc_auc(y_true_test, gnn_probs_test),
+        "pr_auc": _safe_pr_auc(y_true_test, gnn_probs_test),
     }
 
     # --- Strategy A: Feature Augmentation ---
@@ -389,18 +425,28 @@ def run_hybrid_comparison(G, features_df, labels_df, data, model, device="cpu"):
     )
 
     # --- Strategy B: Late Fusion ---
-    best_alpha, strategy_b_metrics, fusion_results = strategy_b_late_fusion(
-        gnn_probs, h_scores_aligned, data.y.cpu(), data.test_mask.cpu()
+    best_alpha, best_threshold, strategy_b_metrics, fusion_results = strategy_b_late_fusion(
+        gnn_probs,
+        h_scores_aligned,
+        data.y.cpu(),
+        data.val_mask.cpu(),
+        data.test_mask.cpu(),
     )
 
     # --- Comparison Table ---
+    strategy_b_test_metrics = {
+        k: strategy_b_metrics[k]
+        for k in ["accuracy", "precision", "recall", "f1", "roc_auc", "pr_auc"]
+    }
+
     comparison = pd.DataFrame([
         {"Model": "Heuristic Only", **heuristic_metrics},
         {"Model": "GNN Only", **gnn_metrics},
         {"Model": "Hybrid (Strategy A)", **strategy_a_metrics},
-        {"Model": "Hybrid (Strategy B, α={:.1f})".format(best_alpha), **{
-            k: v for k, v in strategy_b_metrics.items() if k != "alpha"
-        }},
+        {
+            "Model": "Hybrid (Strategy B, α={:.2f}, thr={:.2f})".format(best_alpha, best_threshold),
+            **strategy_b_test_metrics,
+        },
     ])
 
     logger.info("\n" + "=" * 70)
@@ -408,9 +454,9 @@ def run_hybrid_comparison(G, features_df, labels_df, data, model, device="cpu"):
     logger.info("=" * 70)
     for _, row in comparison.iterrows():
         logger.info(
-            "  %-35s  Acc=%.4f  P=%.4f  R=%.4f  F1=%.4f",
+            "  %-35s  Acc=%.4f  P=%.4f  R=%.4f  F1=%.4f  ROC-AUC=%.4f  PR-AUC=%.4f",
             row["Model"], row["accuracy"], row["precision"],
-            row["recall"], row["f1"]
+            row["recall"], row["f1"], row["roc_auc"], row["pr_auc"]
         )
     logger.info("=" * 70)
 

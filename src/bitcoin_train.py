@@ -54,7 +54,7 @@ def train_on_bitcoin():
         optimizer.zero_grad()
         out = model(data.x, data.edge_index)
 
-        train_mask = data.train_mask & (data.y >= 0)
+        train_mask = data.train_mask & (data.y != -1)
         loss = loss_fn(out[train_mask], data.y[train_mask])
         loss.backward()
         optimizer.step()
@@ -64,7 +64,7 @@ def train_on_bitcoin():
         with torch.no_grad():
             out_eval = model(data.x, data.edge_index)
             preds = out_eval.argmax(dim=1)
-            val_mask = data.val_mask & (data.y >= 0)
+            val_mask = data.val_mask & (data.y != -1)
             y_val = data.y[val_mask].cpu().numpy()
             p_val = preds[val_mask].cpu().numpy()
             val_acc = accuracy_score(y_val, p_val)
@@ -94,7 +94,7 @@ def train_on_bitcoin():
     with torch.no_grad():
         out = model(data.x, data.edge_index)
         probs = torch.softmax(out, dim=1)
-        test_mask = data.test_mask & (data.y >= 0)
+        test_mask = data.test_mask & (data.y != -1)
         y_test = data.y[test_mask].cpu().numpy()
         p_test = out[test_mask].argmax(dim=1).cpu().numpy()
         prob_test = probs[test_mask][:, 1].cpu().numpy()
